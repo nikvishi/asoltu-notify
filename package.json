@@ -1,0 +1,17 @@
+{
+  "name": "asoltu-notify-server",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Swappable email/SMS/WhatsApp notify API. Firebase is not used here.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --env-file=.env index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "nodemailer": "^6.9.16"
+  }
+}

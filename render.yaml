@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: asoltu-notify
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm install --omit=dev
+    startCommand: node index.js
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ERP_COMMS_API_KEY
+        sync: false
+      - key: EMAIL_FROM
+        value: Asoltu School ERP <noreply@asoltuschool.com>
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_SECURE
+        value: "false"
