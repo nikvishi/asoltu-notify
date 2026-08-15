@@ -26,3 +26,7 @@ services:
         sync: false
       - key: SMTP_SECURE
         value: "false"
+      - key: RESEND_API_KEY
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_B64
+        sync: false

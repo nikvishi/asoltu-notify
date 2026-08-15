@@ -1,8 +1,8 @@
 /**
- * Asoltu notify server — email / SMS / WhatsApp HTTP API.
+ * Asoltu notify server — email / SMS / WhatsApp / FCM HTTP API.
  *
- * Firebase is not used. Swap this host later by changing ERP_COMMS_BASE_URL
- * (or Super Admin → Communication → Notify / email server URL).
+ * Privileged credentials stay on this host. Flutter never sees
+ * RESEND_API_KEY or Firebase Admin keys.
  *
  * Env:
  *   PORT
@@ -11,9 +11,12 @@
  *   RESEND_API_KEY             (preferred)
  *   SENDGRID_API_KEY           (optional)
  *   SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / SMTP_SECURE
+ *   FIREBASE_SERVICE_ACCOUNT_B64   (preferred, Admin SDK JSON base64)
+ *   FIREBASE_SERVICE_ACCOUNT_JSON  (raw JSON string)
  */
 const http = require("http");
 const nodemailer = require("nodemailer");
+const admin = require("firebase-admin");
 
 const PORT = Number(process.env.PORT || 8787);
 const API_KEY = (process.env.ERP_COMMS_API_KEY || process.env.ERP_UPLOAD_API_KEY || "").trim();
@@ -135,12 +138,181 @@ async function sendEmail({ to, subject, text, html }) {
   return { id: `queued_${Date.now()}`, provider: "queued", delivered: false };
 }
 
+function fcmReady() {
+  if (admin.apps.length) return true;
+  try {
+    const rawJson = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "").trim();
+    const rawB64 = (process.env.FIREBASE_SERVICE_ACCOUNT_B64 || "").trim();
+    let creds = null;
+    if (rawJson) {
+      creds = JSON.parse(rawJson);
+    } else if (rawB64) {
+      creds = JSON.parse(Buffer.from(rawB64, "base64").toString("utf8"));
+    }
+    if (creds && creds.client_email && creds.private_key) {
+      admin.initializeApp({ credential: admin.credential.cert(creds) });
+      console.info("[notify] Firebase Admin initialized for FCM");
+      return true;
+    }
+    if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+      admin.initializeApp({ credential: admin.credential.applicationDefault() });
+      console.info("[notify] Firebase Admin initialized via ADC");
+      return true;
+    }
+  } catch (e) {
+    console.error("[notify] Firebase Admin init failed:", e.message || e);
+  }
+  return false;
+}
+
+function asStringMap(obj) {
+  const out = {};
+  if (!obj || typeof obj !== "object") return out;
+  for (const [k, v] of Object.entries(obj)) {
+    if (v == null) continue;
+    if (typeof v === "object") continue;
+    out[String(k)] = String(v);
+  }
+  return out;
+}
+
+async function collectTokens(userIds, schoolId) {
+  const tokens = [];
+  const db = admin.firestore();
+  for (const uid of userIds) {
+    if (!uid) continue;
+    const snap = await db.collection("users").doc(uid).collection("tokens").get();
+    for (const doc of snap.docs) {
+      const data = doc.data() || {};
+      const token = String(data.token || doc.id || "").trim();
+      if (!token) continue;
+      const tokenSchool = String(data.schoolId || data.tenantId || "").trim();
+      if (schoolId && tokenSchool && tokenSchool !== schoolId) continue;
+      tokens.push(token);
+    }
+    if (snap.empty) {
+      const user = await db.collection("users").doc(uid).get();
+      const fallback = String((user.data() || {}).fcmToken || "").trim();
+      if (fallback) tokens.push(fallback);
+    }
+  }
+  return [...new Set(tokens)];
+}
+
+async function sendFcm(body) {
+  if (!fcmReady()) {
+    console.warn("[notify] FCM skipped — Firebase Admin credentials missing");
+    return {
+      id: `fcm_unconfigured_${Date.now()}`,
+      provider: "fcm",
+      delivered: false,
+      error: "firebase_admin_unconfigured",
+    };
+  }
+
+  const data = body.data && typeof body.data === "object" ? body.data : {};
+  const userIds = [];
+  if (Array.isArray(data.userIds)) {
+    for (const id of data.userIds) userIds.push(String(id));
+  }
+  if (body.to) userIds.push(String(body.to).trim());
+  const uniqueIds = [...new Set(userIds.filter(Boolean))];
+  if (!uniqueIds.length) {
+    return {
+      id: `fcm_norecipients_${Date.now()}`,
+      provider: "fcm",
+      delivered: false,
+      error: "no_recipients",
+    };
+  }
+
+  const title = String(body.subject || "Asoltu School ERP");
+  const text = String(body.text || "");
+  const schoolId = String(body.schoolId || data.schoolId || "").trim();
+  const type = String(body.type || data.type || "general");
+  const deepLink = String(data.deepLink || "");
+
+  let tokens = [];
+  try {
+    tokens = await collectTokens(uniqueIds, schoolId);
+  } catch (e) {
+    console.error("[notify] FCM token lookup failed:", e.message || e);
+    return {
+      id: `fcm_lookup_${Date.now()}`,
+      provider: "fcm",
+      delivered: false,
+      error: "token_lookup_failed",
+    };
+  }
+
+  if (!tokens.length) {
+    console.info("[notify] FCM no tokens", { users: uniqueIds.length, schoolId, type });
+    return {
+      id: `fcm_notokens_${Date.now()}`,
+      provider: "fcm",
+      delivered: false,
+      error: "no_tokens",
+    };
+  }
+
+  const payloadData = asStringMap({
+    type,
+    title,
+    body: text,
+    message: text,
+    schoolId,
+    deepLink,
+    relatedUserId: data.relatedUserId || "",
+    serverPersisted: "true",
+  });
+
+  try {
+    const result = await admin.messaging().sendEachForMulticast({
+      tokens,
+      notification: { title, body: text },
+      data: payloadData,
+      android: { priority: "high" },
+      apns: {
+        headers: { "apns-priority": "10" },
+        payload: { aps: { sound: "default", badge: 1 } },
+      },
+    });
+    console.info("[notify] FCM", {
+      type,
+      schoolId,
+      tokens: tokens.length,
+      success: result.successCount,
+      failure: result.failureCount,
+    });
+    return {
+      id: `fcm_${Date.now()}`,
+      provider: "fcm",
+      delivered: result.successCount > 0,
+      successCount: result.successCount,
+      failureCount: result.failureCount,
+    };
+  } catch (e) {
+    console.error("[notify] FCM send failed:", e.message || e);
+    return {
+      id: `fcm_error_${Date.now()}`,
+      provider: "fcm",
+      delivered: false,
+      error: "send_failed",
+    };
+  }
+}
+
 async function handleNotify(body) {
   const channel = String(body.channel || "email").toLowerCase();
   const to = String(body.to || "").trim();
   const subject = String(body.subject || "Asoltu School ERP");
   const text = String(body.text || "");
   const html = body.html ? String(body.html) : undefined;
+
+  if (channel === "fcm" || channel === "push") {
+    return sendFcm(body);
+  }
+
   if (!to) {
     const err = new Error("to is required");
     err.status = 400;
@@ -165,6 +337,11 @@ const server = http.createServer(async (req, res) => {
       ok: true,
       service: "asoltu-notify",
       firebase: false,
+      fcm: Boolean(
+        process.env.FIREBASE_SERVICE_ACCOUNT_B64 ||
+          process.env.FIREBASE_SERVICE_ACCOUNT_JSON ||
+          process.env.GOOGLE_APPLICATION_CREDENTIALS
+      ),
       swappable: true,
     });
     return;
