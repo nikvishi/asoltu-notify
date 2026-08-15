@@ -8,6 +8,7 @@
  *   PORT
  *   ERP_COMMS_API_KEY          (required in production)
  *   EMAIL_FROM
+ *   RESEND_API_KEY             (preferred)
  *   SENDGRID_API_KEY           (optional)
  *   SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS / SMTP_SECURE
  */
@@ -61,6 +62,33 @@ function isPlaceholder(value) {
 }
 
 async function sendEmail({ to, subject, text, html }) {
+  const resend = process.env.RESEND_API_KEY || "";
+  if (resend && !isPlaceholder(resend) && resend.startsWith("re_")) {
+    const from = process.env.EMAIL_FROM || "Asoltu School ERP <onboarding@resend.dev>";
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${resend}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        from,
+        to: [to],
+        subject,
+        text: text || subject,
+        html: html || undefined,
+      }),
+    });
+    const body = await res.text();
+    if (!res.ok) throw new Error(`Resend ${res.status}: ${body}`);
+    let id = `re_${Date.now()}`;
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed.id) id = parsed.id;
+    } catch (_) {}
+    return { id, provider: "resend", delivered: true };
+  }
+
   const sendgrid = process.env.SENDGRID_API_KEY || process.env.EMAIL_API_KEY || "";
   if (sendgrid && !isPlaceholder(sendgrid) && sendgrid.startsWith("SG.")) {
     const res = await fetch("https://api.sendgrid.com/v3/mail/send", {
